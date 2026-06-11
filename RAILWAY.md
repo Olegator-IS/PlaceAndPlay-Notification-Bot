@@ -1,28 +1,33 @@
 # Deploy on Railway
 
-This repo contains **two** services. Create both in one Railway project from the same GitHub repository.
+Two services from one GitHub repo. Set **Dockerfile path in Railway UI** for each service.
 
-## 1. Telegram Notification API (web)
-
-| Setting | Value |
-|---------|-------|
-| Dockerfile | `Dockerfile.notification` |
-| Health check | `/health` |
-
-**Environment variables:** copy from `config.env.example` and set in Railway dashboard.
-
-## 2. Telegram App Bot (polling worker)
+## 1. Notification API (web)
 
 | Setting | Value |
 |---------|-------|
-| Dockerfile | `Dockerfile` |
-| Health check | none |
+| Builder | `Dockerfile` |
+| Dockerfile path | `Dockerfile.notification` |
+| Health check | off or `/health` |
+| Public domain | yes |
 
-Uses the same env vars as the notification API.
+**Variables (minimum):**
+- `TELEGRAM_BOT_TOKEN`
+- `NOTIFICATION_API_KEY`
 
-## Local development
+## 2. App Bot worker (polling)
 
-```bash
-cp config.env.example config.env
-docker compose up -d
-```
+| Setting | Value |
+|---------|-------|
+| Builder | `Dockerfile` |
+| Dockerfile path | `Dockerfile` |
+| Health check | **off** |
+| Public domain | **no** |
+
+**Variables:** all from `config.env.example`.
+
+## Auth Service (after API is live)
+
+- `APP_TELEGRAM_BOT_NOTIFICATION_SERVICE_URL` = notification API public URL
+- `TELEGRAM_BOT_API_KEY` = same as `NOTIFICATION_API_KEY`
+- `APP_TELEGRAM_BOT_TOKEN` = same as App Bot `TELEGRAM_BOT_TOKEN`
