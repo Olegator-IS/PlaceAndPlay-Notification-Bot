@@ -264,12 +264,15 @@ class PlaceAndPlayAppBot:
             logger.info(f"  Response: {response.text}")
             
             if response.status_code == 200:
+                branch_line = (
+                    f"Филиал ID: <code>{branch_id}</code>\n\n" if branch_id else "\n"
+                )
                 await update.message.reply_text(
                     f"✅ <b>Успешно подключено!</b>\n\n"
                     f"Теперь вы будете получать уведомления о событиях и бронированиях в Telegram.\n\n"
                     f"Chat ID: <code>{chat_id}</code>\n"
                     f"Организация ID: <code>{org_id}</code>\n"
-                    + (f"Филиал ID: <code>{branch_id}</code>\n\n" if branch_id else "\n")
+                    f"{branch_line}"
                     f"Вы можете вернуться в настройки клуба и увидеть статус подключения.",
                     parse_mode='HTML'
                 )
