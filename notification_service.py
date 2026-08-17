@@ -55,7 +55,8 @@ def check_api_key(f):
 
 
 def send_telegram_message(chat_id: int, message: str, parse_mode: str = 'HTML',
-                          disable_web_page_preview: bool = True) -> bool:
+                          disable_web_page_preview: bool = True,
+                          reply_markup: Optional[Dict] = None) -> bool:
     """
     Отправка сообщения в Telegram (синхронный метод через requests)
     
@@ -63,6 +64,7 @@ def send_telegram_message(chat_id: int, message: str, parse_mode: str = 'HTML',
         chat_id: ID чата в Telegram
         message: Текст сообщения
         parse_mode: Режим парсинга (HTML, Markdown)
+        reply_markup: Опциональная клавиатура Telegram (inline_keyboard и т.д.)
     
     Returns:
         True если сообщение отправлено успешно, False в противном случае
@@ -75,6 +77,8 @@ def send_telegram_message(chat_id: int, message: str, parse_mode: str = 'HTML',
             "parse_mode": parse_mode,
             "disable_web_page_preview": disable_web_page_preview,
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         
         logger.debug(f"Отправка сообщения в Telegram: chat_id={chat_id}, parse_mode={parse_mode}, message={message[:200]}...")
         
@@ -85,6 +89,8 @@ def send_telegram_message(chat_id: int, message: str, parse_mode: str = 'HTML',
         return True
     except requests.exceptions.RequestException as e:
         logger.error(f"Ошибка отправки сообщения в Telegram: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"Ответ Telegram: {e.response.text}")
         return False
     except Exception as e:
         logger.error(f"Неожиданная ошибка при отправке сообщения: {e}")
@@ -149,9 +155,12 @@ def send_notification():
         disable_preview = data.get('disable_web_page_preview', True)
         if not isinstance(disable_preview, bool):
             disable_preview = True
+        reply_markup = data.get('reply_markup')
+        if reply_markup is not None and not isinstance(reply_markup, dict):
+            reply_markup = None
         
         # Отправляем сообщение
-        success = send_telegram_message(chat_id, message, parse_mode, disable_preview)
+        success = send_telegram_message(chat_id, message, parse_mode, disable_preview, reply_markup)
         
         if success:
             return jsonify({

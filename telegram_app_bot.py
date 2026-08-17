@@ -6,6 +6,8 @@ import logging
 from typing import Dict, Optional
 from datetime import datetime, timedelta
 import os
+import html
+import time
 import requests
 from dotenv import load_dotenv
 
@@ -79,6 +81,8 @@ class PlaceAndPlayAppBot:
         
         # Хранение состояний пользователей
         self.user_states: Dict[int, UserState] = {}
+        # chat_id -> {event_id, original_message_id, prompt_message_id, started_at}
+        self.pending_rejects: Dict[int, dict] = {}
         
         # Инициализация бота с настройками HTTP клиента
         self.application = Application.builder().token(
@@ -101,12 +105,18 @@ class PlaceAndPlayAppBot:
         
         # Обработка callback'ов для дополнительных действий
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_reject_reason_message)
+        )
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка команды /start"""
         user = update.effective_user
         logger.info(f"Получена команда /start от пользователя {user.id} (@{user.username})")
         
+        if update.effective_chat:
+            self.pending_rejects.pop(update.effective_chat.id, None)
+
         # Проверяем, есть ли параметр для подключения организации
         if context.args and len(context.args) > 0:
             start_param = context.args[0]
@@ -174,6 +184,7 @@ class PlaceAndPlayAppBot:
     "• 📅 Уведомления о новых бронированиях\n"
     "• ⏰ Информацию о времени и корте\n"
     "• 👤 Данные о клиенте (имя и телефон)\n"
+    "• ✅ Кнопки «Подтвердить» / «Отклонить» для заявок на регистрацию\n"
     "• 🔗 Прямую ссылку на просмотр бронирования\n\n"
     "💼 <b>Управление клубом:</b>\n"
     "Перейдите на <a href='https://sports.placeandplay.uz'>sports.placeandplay.uz</a> для:\n"
@@ -438,6 +449,12 @@ class PlaceAndPlayAppBot:
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка callback'ов от inline кнопок"""
         query = update.callback_query
+        data = query.data or ""
+
+        if data.startswith("reg_ok:") or data.startswith("reg_no:") or data.startswith("reg_cancel:"):
+            await self.handle_registration_callback(query, context)
+            return
+
         await query.answer()
         
         if query.data == 'about_project':
@@ -469,6 +486,199 @@ class PlaceAndPlayAppBot:
             )
         else:
             await query.edit_message_text("❌ Неизвестная команда.")
+
+    def _registration_keyboard(self, event_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Подтвердить", callback_data=f"reg_ok:{event_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"reg_no:{event_id}"),
+        ]])
+
+    def _events_service_url(self) -> str:
+        return os.getenv('PLACE_AND_PLAY_EVENTS_SERVICE_URL', 'http://localhost:8082/PlaceAndPlay').rstrip('/')
+
+    def _events_bot_headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        bot_api_key = os.getenv('TELEGRAM_BOT_API_KEY')
+        if bot_api_key:
+            headers["X-Telegram-Bot-Key"] = bot_api_key
+        return headers
+
+    def _parse_event_id(self, data: str) -> Optional[int]:
+        try:
+            return int(data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def _send_registration_decision(self, event_id: int, action: str, telegram_chat_id: int, reason: Optional[str] = None):
+        url = f"{self._events_service_url()}/events/club-bot/registration-decision"
+        payload = {
+            "eventId": event_id,
+            "action": action,
+            "telegramChatId": telegram_chat_id,
+        }
+        if reason:
+            payload["reason"] = reason
+        logger.info(f"Club bot registration decision: {action} event_id={event_id} chat_id={telegram_chat_id}")
+        response = requests.post(url, json=payload, headers=self._events_bot_headers(), timeout=20)
+        message = None
+        try:
+            body = response.json()
+            message = body.get("message")
+        except Exception:
+            message = response.text
+        return response.status_code, message
+
+    def _expire_stale_rejects(self):
+        now = time.time()
+        stale = [chat_id for chat_id, item in self.pending_rejects.items()
+                 if now - item.get("started_at", 0) > 15 * 60]
+        for chat_id in stale:
+            self.pending_rejects.pop(chat_id, None)
+
+    async def handle_registration_callback(self, query, context: ContextTypes.DEFAULT_TYPE):
+        data = query.data or ""
+        event_id = self._parse_event_id(data)
+        chat_id = query.message.chat_id if query.message else None
+        original_message_id = query.message.message_id if query.message else None
+
+        if event_id is None or chat_id is None:
+            await query.answer("Некорректные данные заявки", show_alert=True)
+            return
+
+        if data.startswith("reg_cancel:"):
+            await query.answer("Отменено")
+            pending = self.pending_rejects.get(chat_id)
+            original_id = pending.get("original_message_id") if pending else original_message_id
+            self.pending_rejects.pop(chat_id, None)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            if original_id:
+                try:
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=original_id,
+                        reply_markup=self._registration_keyboard(event_id),
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось вернуть кнопки заявки {event_id}: {e}")
+            return
+
+        if data.startswith("reg_ok:"):
+            await query.answer("Подтверждаем…")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            try:
+                status, message = self._send_registration_decision(event_id, "approve", chat_id)
+            except Exception as e:
+                logger.error(f"Ошибка подтверждения заявки {event_id}: {e}")
+                await context.bot.send_message(chat_id=chat_id, text="❌ Не удалось подтвердить заявку. Попробуйте ещё раз.")
+                try:
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=original_message_id,
+                        reply_markup=self._registration_keyboard(event_id),
+                    )
+                except Exception:
+                    pass
+                return
+            if status == 200:
+                self.pending_rejects.pop(chat_id, None)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="✅ Заявка подтверждена. Статус: <b>ожидает оплаты</b>.",
+                    parse_mode="HTML",
+                    reply_to_message_id=original_message_id,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Не удалось подтвердить заявку.\n{html.escape(message or 'Ошибка сервера')}",
+                    parse_mode="HTML",
+                    reply_to_message_id=original_message_id,
+                )
+                if status >= 500:
+                    try:
+                        await context.bot.edit_message_reply_markup(
+                            chat_id=chat_id,
+                            message_id=original_message_id,
+                            reply_markup=self._registration_keyboard(event_id),
+                        )
+                    except Exception:
+                        pass
+            return
+
+        if data.startswith("reg_no:"):
+            await query.answer("Укажите причину отклонения")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            prompt = await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✏️ Напишите причину отклонения <b>одним сообщением</b>.\n"
+                    "Она будет отправлена участникам."
+                ),
+                parse_mode="HTML",
+                reply_to_message_id=original_message_id,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Отмена", callback_data=f"reg_cancel:{event_id}")
+                ]]),
+            )
+            self.pending_rejects[chat_id] = {
+                "event_id": event_id,
+                "original_message_id": original_message_id,
+                "prompt_message_id": prompt.message_id,
+                "started_at": time.time(),
+            }
+
+    async def handle_reject_reason_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not update.effective_chat:
+            return
+        self._expire_stale_rejects()
+        chat_id = update.effective_chat.id
+        pending = self.pending_rejects.get(chat_id)
+        if not pending:
+            return
+
+        reason = (update.message.text or "").strip()
+        if not reason:
+            await update.message.reply_text("Пожалуйста, напишите причину отклонения текстом.")
+            return
+
+        event_id = pending["event_id"]
+        original_message_id = pending.get("original_message_id")
+        try:
+            status, message = self._send_registration_decision(event_id, "reject", chat_id, reason)
+        except Exception as e:
+            logger.error(f"Ошибка отклонения заявки {event_id}: {e}")
+            await update.message.reply_text("❌ Не удалось отклонить заявку. Попробуйте ещё раз или напишите причину повторно.")
+            return
+
+        if status == 200:
+            self.pending_rejects.pop(chat_id, None)
+            await update.message.reply_text(
+                f"❌ Заявка отклонена.\nПричина: {html.escape(reason)}",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Не удалось отклонить заявку.\n{html.escape(message or 'Ошибка сервера')}",
+                parse_mode="HTML",
+            )
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=original_message_id,
+                    reply_markup=self._registration_keyboard(event_id),
+                )
+            except Exception:
+                pass
+            self.pending_rejects.pop(chat_id, None)
     
     async def show_about_project(self, query, context):
         """Показать информацию о проекте"""
