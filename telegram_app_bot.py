@@ -9,6 +9,7 @@ import os
 import html
 import time
 import requests
+from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -494,7 +495,20 @@ class PlaceAndPlayAppBot:
         ]])
 
     def _events_service_url(self) -> str:
-        return os.getenv('PLACE_AND_PLAY_EVENTS_SERVICE_URL', 'http://localhost:8082/PlaceAndPlay').rstrip('/')
+        raw = os.getenv(
+            'PLACE_AND_PLAY_EVENTS_SERVICE_URL',
+            'https://placeandplay-events-service-production.up.railway.app/PlaceAndPlay',
+        ).rstrip('/')
+        parsed = urlparse(raw)
+        # Bare *.railway.internal defaults to port 80; Events listens on 8082.
+        if parsed.hostname and parsed.hostname.endswith('.railway.internal') and parsed.port is None:
+            netloc = f"{parsed.hostname}:8082"
+            raw = urlunparse((parsed.scheme or 'http', netloc, parsed.path or '', '', '', '')).rstrip('/')
+            logger.warning(
+                "PLACE_AND_PLAY_EVENTS_SERVICE_URL without port; using %s",
+                raw,
+            )
+        return raw
 
     def _events_bot_headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -518,8 +532,12 @@ class PlaceAndPlayAppBot:
         }
         if reason:
             payload["reason"] = reason
-        logger.info(f"Club bot registration decision: {action} event_id={event_id} chat_id={telegram_chat_id}")
-        response = requests.post(url, json=payload, headers=self._events_bot_headers(), timeout=20)
+        logger.info(f"Club bot registration decision: {action} event_id={event_id} chat_id={telegram_chat_id} url={url}")
+        try:
+            response = requests.post(url, json=payload, headers=self._events_bot_headers(), timeout=20)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка HTTP к Events Service ({url}): {e}")
+            raise
         message = None
         try:
             body = response.json()
