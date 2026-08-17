@@ -523,6 +523,66 @@ class PlaceAndPlayAppBot:
         except (IndexError, ValueError):
             return None
 
+    def _extract_booking_details(self, text: str) -> str:
+        if not text:
+            return ""
+        lines = [ln.rstrip() for ln in text.splitlines()]
+        while lines and (not lines[0].strip() or "Новое бронирование" in lines[0]):
+            lines.pop(0)
+        cut_markers = (
+            "Нажмите кнопку",
+            "Открыть бронирование",
+            "Напишите причину",
+        )
+        kept = []
+        for ln in lines:
+            if any(marker in ln for marker in cut_markers):
+                break
+            kept.append(ln)
+        return "\n".join(kept).strip()
+
+    def _format_decision_text(self, approved: bool, reason: Optional[str], original_text: str) -> str:
+        if approved:
+            header = "✅ Заявка подтверждена. Статус: ожидает оплаты."
+        else:
+            header = "❌ Заявка отклонена."
+            if reason:
+                header += f"\nПричина: {html.escape(reason)}"
+        booking = self._extract_booking_details(original_text)
+        if booking:
+            return f"{header}\n\n{booking}"
+        return header
+
+    async def _show_registration_result(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        original_message_id: Optional[int],
+        original_text: str,
+        approved: bool,
+        reason: Optional[str] = None,
+        fallback_reply_to: Optional[int] = None,
+    ):
+        text = self._format_decision_text(approved, reason, original_text)
+        if original_message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=original_message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Не удалось обновить исходное сообщение заявки: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_to_message_id=fallback_reply_to or original_message_id,
+        )
+
     def _send_registration_decision(self, event_id: int, action: str, telegram_chat_id: int, reason: Optional[str] = None):
         url = f"{self._events_service_url()}/events/club-bot/registration-decision"
         payload = {
@@ -585,6 +645,7 @@ class PlaceAndPlayAppBot:
 
         if data.startswith("reg_ok:"):
             await query.answer("Подтверждаем…")
+            original_text = query.message.text or query.message.caption or ""
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
@@ -605,11 +666,12 @@ class PlaceAndPlayAppBot:
                 return
             if status == 200:
                 self.pending_rejects.pop(chat_id, None)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="✅ Заявка подтверждена. Статус: <b>ожидает оплаты</b>.",
-                    parse_mode="HTML",
-                    reply_to_message_id=original_message_id,
+                await self._show_registration_result(
+                    context,
+                    chat_id,
+                    original_message_id,
+                    original_text,
+                    approved=True,
                 )
             else:
                 await context.bot.send_message(
@@ -650,6 +712,7 @@ class PlaceAndPlayAppBot:
             self.pending_rejects[chat_id] = {
                 "event_id": event_id,
                 "original_message_id": original_message_id,
+                "original_text": query.message.text or query.message.caption or "",
                 "prompt_message_id": prompt.message_id,
                 "started_at": time.time(),
             }
@@ -670,6 +733,8 @@ class PlaceAndPlayAppBot:
 
         event_id = pending["event_id"]
         original_message_id = pending.get("original_message_id")
+        original_text = pending.get("original_text") or ""
+        prompt_message_id = pending.get("prompt_message_id")
         try:
             status, message = self._send_registration_decision(event_id, "reject", chat_id, reason)
         except Exception as e:
@@ -679,9 +744,19 @@ class PlaceAndPlayAppBot:
 
         if status == 200:
             self.pending_rejects.pop(chat_id, None)
-            await update.message.reply_text(
-                f"❌ Заявка отклонена.\nПричина: {html.escape(reason)}",
-                parse_mode="HTML",
+            if prompt_message_id:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=prompt_message_id)
+                except Exception:
+                    pass
+            await self._show_registration_result(
+                context,
+                chat_id,
+                original_message_id,
+                original_text,
+                approved=False,
+                reason=reason,
+                fallback_reply_to=update.message.message_id,
             )
         else:
             await update.message.reply_text(
