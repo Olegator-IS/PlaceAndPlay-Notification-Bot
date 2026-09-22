@@ -36,19 +36,31 @@ def parse_connect_tokens(raw: str):
     """
     connect_62 -> (62, None)
     connect_62_13 -> (62, 13)
+    /connect 80_25 -> (80, 25)
+    80_25 -> (80, 25)
     """
-    if not raw or not raw.startswith("connect_"):
+    if not raw:
         return None, None
-    rest = raw[len("connect_"):]
-    if not rest:
-        return None, None
-    parts = rest.split("_")
+    value = raw.strip().replace("-", "_")
+    lower = value.lower()
+    if lower.startswith("/connect"):
+        value = value[8:].strip()
+        lower = value.lower()
+    if lower.startswith("connect_"):
+        value = value[8:]
+    elif lower.startswith("connect "):
+        value = value[8:].strip()
+    elif lower == "connect":
+        value = ""
+    parts = [p for p in value.replace(" ", "_").split("_") if p]
     try:
-        org_id = int(parts[0])
-        branch_id = int(parts[1]) if len(parts) > 1 else None
-        return org_id, branch_id
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
+        if len(parts) == 1:
+            return int(parts[0]), None
     except ValueError:
         return None, None
+    return None, None
 
 
 EMOJIS = {
@@ -201,107 +213,89 @@ class PlaceAndPlayAppBot:
     
     async def connect_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка команды /connect для подключения Telegram уведомлений"""
-        user = update.effective_user
         chat_id = update.effective_chat.id
-        
-        command_text = update.message.text or ""
-        org_id = None
-        branch_id = None
-
-        if len(context.args) > 0:
-            try:
-                org_id = int(context.args[0])
-            except ValueError:
-                pass
-            if len(context.args) > 1:
-                try:
-                    branch_id = int(context.args[1])
-                except ValueError:
-                    pass
-
-        if org_id is None and 'connect_' in command_text:
-            org_id, branch_id = parse_connect_tokens(
-                command_text.split()[-1] if ' ' in command_text else command_text.replace('/connect', 'connect', 1)
-            )
+        command_text = (update.message.text or "").strip()
+        args_payload = " ".join(context.args).strip() if context.args else ""
+        org_id, branch_id = parse_connect_tokens(args_payload)
+        if org_id is None:
+            org_id, branch_id = parse_connect_tokens(command_text)
 
         if org_id is None:
             await update.message.reply_text(
-                "❌ <b>Ошибка подключения</b>\n\n"
-                "Для подключения уведомлений используйте команду из настроек вашего клуба в системе Place&Play.\n\n"
-                "Если вы перешли по ссылке из настроек, но видите это сообщение, пожалуйста, обратитесь в поддержку.",
+                "Чтобы подключить уведомления клуба, откройте настройки в кабинете "
+                "или отправьте команду в формате:\n\n"
+                "<code>/connect 80_25</code>\n\n"
+                "где 80 — ID организации, 25 — ID филиала.",
                 parse_mode='HTML'
             )
             return
-        
+
         try:
-            # Отправляем chat_id на сервер для сохранения
-            load_dotenv('config.env')
-            # Events-Service работает на порту 8082
-            events_service_url = os.getenv('PLACE_AND_PLAY_EVENTS_SERVICE_URL', 'http://localhost:8082/PlaceAndPlay')
-            
-            # Подготавливаем заголовки
-            headers = {"Content-Type": "application/json"}
-            
-            # Добавляем API ключ, если он настроен
-            bot_api_key = os.getenv('TELEGRAM_BOT_API_KEY')
-            if bot_api_key:
-                headers["X-Telegram-Bot-Key"] = bot_api_key
-            
-            # Формируем URL для запроса
+            events_service_url = self._events_service_url()
+            headers = self._events_bot_headers()
+            payload = {
+                "orgId": org_id,
+                "organizationId": org_id,
+                "branchId": branch_id,
+                "telegramChatId": chat_id,
+                "chatId": str(chat_id),
+            }
+            attempts = []
             if branch_id is not None:
-                api_url = f"{events_service_url}/organizations/branches/{branch_id}/telegram-chat"
-                payload = {"telegramChatId": chat_id, "organizationId": org_id}
-            else:
-                api_url = f"{events_service_url}/organizations/{org_id}/telegram-chat"
-                payload = {"telegramChatId": chat_id}
-            
-            # Логируем детали запроса
-            logger.info(f"Отправка запроса на сохранение telegram chat_id:")
-            logger.info(f"  URL: {api_url}")
-            logger.info(f"  Method: PUT")
-            logger.info(f"  Headers: {headers}")
-            logger.info(f"  Payload: {payload}")
-            logger.info(f"  Events Service URL из config: {events_service_url}")
-            
-            # Вызываем API для сохранения chat_id
-            response = requests.put(
-                api_url,
-                json=payload,
-                headers=headers,
-                timeout=10
+                attempts.append(
+                    ("PUT", f"{events_service_url}/organizations/branches/{branch_id}/telegram-chat")
+                )
+            attempts.extend([
+                ("PUT", f"{events_service_url}/organizations/{org_id}/telegram-chat"),
+                ("POST", f"{events_service_url}/organizations/{org_id}/telegram-chat"),
+                ("POST", f"{events_service_url}/bot/organizations/telegram-chat"),
+                ("POST", f"{events_service_url}/organizations/telegram-chat"),
+            ])
+
+            last_error = None
+            for method, api_url in attempts:
+                logger.info("Saving telegram chat_id: %s %s payload=%s", method, api_url, payload)
+                try:
+                    response = requests.request(
+                        method, api_url, json=payload, headers=headers, timeout=15
+                    )
+                except Exception as req_err:
+                    last_error = str(req_err)
+                    logger.exception("Connect request failed for %s %s", method, api_url)
+                    continue
+                logger.info(
+                    "Connect response %s %s -> %s %s",
+                    method, api_url, response.status_code, response.text[:400],
+                )
+                if response.status_code == 200:
+                    branch_line = (
+                        f"Филиал ID: <code>{branch_id}</code>\n\n" if branch_id else "\n"
+                    )
+                    await update.message.reply_text(
+                        f"✅ <b>Успешно подключено!</b>\n\n"
+                        f"Теперь вы будете получать уведомления о событиях и бронированиях в Telegram.\n\n"
+                        f"Chat ID: <code>{chat_id}</code>\n"
+                        f"Организация ID: <code>{org_id}</code>\n"
+                        f"{branch_line}"
+                        f"Вы можете вернуться в настройки клуба и увидеть статус подключения.",
+                        parse_mode='HTML'
+                    )
+                    return
+                last_error = f"{response.status_code}: {response.text[:300]}"
+
+            logger.error("Failed to save telegram chat_id: %s", last_error)
+            await update.message.reply_text(
+                "❌ <b>Ошибка подключения</b>\n\n"
+                "Не удалось сохранить подключение. Пожалуйста, попробуйте позже или обратитесь в поддержку.\n\n"
+                f"<code>{html.escape(last_error or 'unknown')}</code>",
+                parse_mode='HTML'
             )
-            
-            logger.info(f"Ответ от сервера:")
-            logger.info(f"  Status Code: {response.status_code}")
-            logger.info(f"  Response: {response.text}")
-            
-            if response.status_code == 200:
-                branch_line = (
-                    f"Филиал ID: <code>{branch_id}</code>\n\n" if branch_id else "\n"
-                )
-                await update.message.reply_text(
-                    f"✅ <b>Успешно подключено!</b>\n\n"
-                    f"Теперь вы будете получать уведомления о событиях и бронированиях в Telegram.\n\n"
-                    f"Chat ID: <code>{chat_id}</code>\n"
-                    f"Организация ID: <code>{org_id}</code>\n"
-                    f"{branch_line}"
-                    f"Вы можете вернуться в настройки клуба и увидеть статус подключения.",
-                    parse_mode='HTML'
-                )
-            else:
-                error_text = response.text if hasattr(response, 'text') else 'Unknown error'
-                logger.error(f"Failed to save telegram chat_id: {response.status_code} - {error_text}")
-                await update.message.reply_text(
-                    f"❌ <b>Ошибка подключения</b>\n\n"
-                    f"Не удалось сохранить подключение. Пожалуйста, попробуйте позже или обратитесь в поддержку.\n\n"
-                    f"Код ошибки: {response.status_code}",
-                    parse_mode='HTML'
-                )
         except Exception as e:
             logger.error(f"Error in connect_command: {e}")
             await update.message.reply_text(
                 "❌ <b>Ошибка подключения</b>\n\n"
-                "Произошла ошибка при подключении. Пожалуйста, попробуйте позже или обратитесь в поддержку.",
+                "Произошла ошибка при подключении. Пожалуйста, попробуйте позже или обратитесь в поддержку.\n\n"
+                f"<code>{html.escape(str(e))}</code>",
                 parse_mode='HTML'
             )
     
