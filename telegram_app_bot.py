@@ -18,7 +18,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
-    ContextTypes, MessageHandler, filters
+    ContextTypes, MessageHandler, filters, ChosenInlineResultHandler
 )
 
 from models import UserState, Sport, Place, Event
@@ -119,6 +119,10 @@ class PlaceAndPlayAppBot:
         # Контакт, которым пользователь поделился (вход новичков из Mini App)
         self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
         
+        # Карточка события отправлена в чат (Mini App shareMessage): запоминаем inline_message_id,
+        # чтобы потом обновлять список участников. Нужен /setinlinefeedback в BotFather.
+        self.application.add_handler(ChosenInlineResultHandler(self.handle_chosen_inline_result))
+
         # Обработка данных от веб-приложения
         self.application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, self.handle_webapp_data))
         
@@ -128,6 +132,46 @@ class PlaceAndPlayAppBot:
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_reject_reason_message)
         )
     
+    async def handle_chosen_inline_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пользователь отправил карточку события в чат — регистрируем её в Events-Service."""
+        chosen = update.chosen_inline_result
+        if not chosen:
+            return
+        # Лог нужен и для проверки: приходит ли событие для prepared-сообщений
+        logger.info(
+            "CHOSEN_INLINE_RESULT result_id=%s inline_message_id=%s from=%s",
+            chosen.result_id, chosen.inline_message_id, chosen.from_user.id if chosen.from_user else None,
+        )
+        if not chosen.result_id.startswith("ev") or not chosen.inline_message_id:
+            return
+        try:
+            event_id = int(chosen.result_id[2:])
+        except ValueError:
+            return
+        base = (os.getenv("EVENTS_INTERNAL_BASE_URL") or "").rstrip("/")
+        key = os.getenv("EVENTS_CARD_REGISTER_KEY") or ""
+        if not base or not key:
+            logger.warning("EVENTS_INTERNAL_BASE_URL/EVENTS_CARD_REGISTER_KEY не заданы — карточка не зарегистрирована")
+            return
+
+        def _post():
+            return requests.post(
+                f"{base}/internal/event-cards",
+                json={
+                    "eventId": event_id,
+                    "inlineMessageId": chosen.inline_message_id,
+                    "telegramUserId": chosen.from_user.id if chosen.from_user else None,
+                },
+                headers={"X-Internal-Key": key},
+                timeout=10,
+            )
+
+        try:
+            resp = await asyncio.to_thread(_post)
+            logger.info("Регистрация карточки события %s: HTTP %s", event_id, resp.status_code)
+        except Exception as e:
+            logger.error("Не удалось зарегистрировать карточку события %s: %s", event_id, e)
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка команды /start"""
         user = update.effective_user

@@ -378,6 +378,103 @@ def send_event_notification():
         }), 500
 
 
+# ---------------------------------------------------------------------------
+# Карточка события для пересылки в чаты (Mini App shareMessage)
+# ---------------------------------------------------------------------------
+
+def _share_markup(button_text: str, button_url: str) -> Dict:
+    return {"inline_keyboard": [[{"text": button_text, "url": button_url}]]}
+
+
+@app.route('/prepare-share', methods=['POST'])
+@check_api_key
+def prepare_share():
+    """
+    Готовит «карточку» события от имени бота (savePreparedInlineMessage).
+    Mini App потом вызывает Telegram.WebApp.shareMessage(id) — пользователь выбирает чат,
+    и карточка уходит туда с кнопкой «Присоединиться».
+    Тело: {telegramUserId, eventId, title, text (HTML), buttonText, buttonUrl}
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        user_id = int(data.get('telegramUserId'))
+        event_id = int(data.get('eventId'))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'telegramUserId and eventId are required'}), 400
+    text = (data.get('text') or '').strip()
+    button_url = (data.get('buttonUrl') or '').strip()
+    if not text or not button_url.startswith('https://'):
+        return jsonify({'success': False, 'error': 'text and https buttonUrl are required'}), 400
+
+    result = {
+        "type": "article",
+        # id нужен, чтобы по chosen_inline_result понять, какое это событие
+        "id": f"ev{event_id}",
+        "title": (data.get('title') or 'Place&Play')[:100],
+        "input_message_content": {
+            "message_text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        },
+        "reply_markup": _share_markup((data.get('buttonText') or 'Присоединиться')[:64], button_url),
+    }
+    payload = {
+        "user_id": user_id,
+        "result": result,
+        "allow_user_chats": True,
+        "allow_bot_chats": False,
+        "allow_group_chats": True,
+        "allow_channel_chats": False,
+    }
+    try:
+        resp = requests.post(f"{TELEGRAM_API_URL}/savePreparedInlineMessage", json=payload, timeout=10)
+        body = resp.json() if resp.content else {}
+        if not resp.ok or not body.get('ok'):
+            logger.error(f"savePreparedInlineMessage failed: {resp.status_code} {resp.text[:300]}")
+            return jsonify({'success': False, 'error': body.get('description', 'telegram error')}), 502
+        prepared = body.get('result', {})
+        return jsonify({'success': True, 'id': prepared.get('id'), 'expirationDate': prepared.get('expiration_date')})
+    except requests.exceptions.RequestException as e:
+        logger.error(f"savePreparedInlineMessage error: {e}")
+        return jsonify({'success': False, 'error': 'telegram unreachable'}), 502
+
+
+@app.route('/refresh-share', methods=['POST'])
+@check_api_key
+def refresh_share():
+    """
+    Обновляет уже отправленную в чат карточку (editMessageText по inline_message_id).
+    Тело: {inlineMessageId, text (HTML), buttonText, buttonUrl}
+    """
+    data = request.get_json(silent=True) or {}
+    inline_message_id = (data.get('inlineMessageId') or '').strip()
+    text = (data.get('text') or '').strip()
+    button_url = (data.get('buttonUrl') or '').strip()
+    if not inline_message_id or not text or not button_url.startswith('https://'):
+        return jsonify({'success': False, 'error': 'inlineMessageId, text and https buttonUrl are required'}), 400
+    payload = {
+        "inline_message_id": inline_message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "link_preview_options": {"is_disabled": True},
+        "reply_markup": _share_markup((data.get('buttonText') or 'Присоединиться')[:64], button_url),
+    }
+    try:
+        resp = requests.post(f"{TELEGRAM_API_URL}/editMessageText", json=payload, timeout=10)
+        body = resp.json() if resp.content else {}
+        if resp.ok and body.get('ok'):
+            return jsonify({'success': True})
+        description = str(body.get('description', ''))
+        if 'message is not modified' in description:
+            return jsonify({'success': True, 'unchanged': True})
+        logger.warning(f"editMessageText failed: {resp.status_code} {description[:200]}")
+        # 400 «message to edit not found» и подобное — карточку уже не обновить, Events-Service её забудет
+        return jsonify({'success': False, 'error': description or 'telegram error', 'gone': resp.status_code == 400}), 502
+    except requests.exceptions.RequestException as e:
+        logger.error(f"editMessageText error: {e}")
+        return jsonify({'success': False, 'error': 'telegram unreachable'}), 502
+
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', os.getenv('NOTIFICATION_SERVICE_PORT', '5000')))
     host = os.getenv('NOTIFICATION_SERVICE_HOST', '0.0.0.0')
