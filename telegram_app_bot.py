@@ -156,7 +156,7 @@ class PlaceAndPlayAppBot:
 
         def _post():
             return requests.post(
-                f"{base}/internal/event-cards",
+                f"{base}/bot/event-cards",
                 json={
                     "eventId": event_id,
                     "inlineMessageId": chosen.inline_message_id,
