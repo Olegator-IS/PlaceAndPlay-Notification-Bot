@@ -12,7 +12,10 @@ import requests
 from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo,
+    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
     ContextTypes, MessageHandler, filters
@@ -112,6 +115,9 @@ class PlaceAndPlayAppBot:
         self.application.add_handler(CommandHandler('start', self.start_command))
         self.application.add_handler(CommandHandler('help', self.help_command))
         self.application.add_handler(CommandHandler('connect', self.connect_command))
+        self.application.add_handler(CommandHandler('phone', self.phone_command))
+        # Контакт, которым пользователь поделился (вход новичков из Mini App)
+        self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
         
         # Обработка данных от веб-приложения
         self.application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, self.handle_webapp_data))
@@ -134,6 +140,9 @@ class PlaceAndPlayAppBot:
         if context.args and len(context.args) > 0:
             start_param = context.args[0]
             logger.info(f"Параметр start: {start_param}")
+            if start_param == 'phone':
+                await self.phone_command(update, context)
+                return
             if start_param.startswith('connect_'):
                 org_id, branch_id = parse_connect_tokens(start_param)
                 if org_id is not None:
@@ -183,6 +192,83 @@ class PlaceAndPlayAppBot:
                 "❌ Произошла ошибка при обработке команды. Пожалуйста, попробуйте позже."
             )
     
+    # ------------------------------------------------------------------
+    # Вход новичков из Mini App: пользователь делится контактом с ботом.
+    # Telegram гарантирует, что contact.user_id — владелец номера, если
+    # он совпадает с id отправителя. Номер сохраняется в Auth-Service.
+    # ------------------------------------------------------------------
+    async def phone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает кнопку «Поделиться номером» (запасной путь, если Mini App не смог запросить контакт)."""
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 Поделиться номером", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await update.message.reply_text(
+            "Нажмите кнопку ниже, чтобы поделиться номером телефона. "
+            "Он нужен, чтобы записать вас на игру. После этого вернитесь в приложение.",
+            reply_markup=keyboard,
+        )
+
+    def _auth_internal_base_url(self) -> str:
+        # Внутренний эндпоинт лежит под context-path Auth-Service (/PlaceAndPlay), без "/api"
+        raw = os.getenv('AUTH_INTERNAL_BASE_URL') or os.getenv('PLACE_AND_PLAY_API_BASE_URL', '')
+        raw = raw.rstrip('/')
+        if raw.endswith('/api'):
+            raw = raw[:-4]
+        return raw
+
+    def _save_verified_contact(self, telegram_user_id: int, phone: str, first_name, last_name) -> bool:
+        key = os.getenv('AUTH_BOT_CONTACT_KEY')
+        base = self._auth_internal_base_url()
+        if not key or not base:
+            logger.error("AUTH_BOT_CONTACT_KEY или AUTH_INTERNAL_BASE_URL не заданы — контакт не сохранён")
+            return False
+        try:
+            resp = requests.post(
+                f"{base}/internal/telegram/verified-contact",
+                json={
+                    "telegramUserId": telegram_user_id,
+                    "phone": phone,
+                    "firstName": first_name,
+                    "lastName": last_name,
+                },
+                headers={"X-Internal-Service-Key": key, "Content-Type": "application/json"},
+                timeout=10,
+            )
+            ok = resp.status_code == 200 and resp.json().get("success") is True
+            if not ok:
+                logger.error("Auth-Service отклонил контакт: status=%s", resp.status_code)
+            return ok
+        except Exception as e:  # не логируем номер и тело ответа
+            logger.error("Не удалось сохранить контакт в Auth-Service: %s", type(e).__name__)
+            return False
+
+    async def handle_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        user = update.effective_user
+        contact = message.contact if message else None
+        if not contact or not user:
+            return
+        # Принимаем только СВОЙ контакт: иначе можно было бы "подтвердить" чужой номер
+        if contact.user_id != user.id:
+            await message.reply_text(
+                "Пожалуйста, отправьте свой собственный номер кнопкой «Поделиться номером».",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        ok = await asyncio.to_thread(
+            self._save_verified_contact,
+            user.id, contact.phone_number,
+            contact.first_name or user.first_name, contact.last_name or user.last_name,
+        )
+        if ok:
+            await message.reply_text("✅ Готово! Вернитесь в приложение, вы уже можете записаться на игру.",
+                                     reply_markup=ReplyKeyboardRemove())
+        else:
+            await message.reply_text("Не получилось сохранить номер. Попробуйте ещё раз чуть позже.",
+                                     reply_markup=ReplyKeyboardRemove())
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка команды /help"""
         help_text = (
