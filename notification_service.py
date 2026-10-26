@@ -35,6 +35,11 @@ if not TELEGRAM_BOT_TOKEN:
 # Это избегает проблем с event loop в Flask
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Карточки «Присоединиться» должен готовить именно бот, из которого открывается Mini App
+# (placeandplay_notification_bot). Если переменная не задана — используем основной токен.
+SHARE_CARD_BOT_TOKEN = os.getenv('SHARE_CARD_BOT_TOKEN') or TELEGRAM_BOT_TOKEN
+SHARE_CARD_API_URL = f"https://api.telegram.org/bot{SHARE_CARD_BOT_TOKEN}"
+
 # API ключ для защиты endpoint (опционально)
 API_KEY = os.getenv('NOTIFICATION_API_KEY', '')
 
@@ -427,7 +432,7 @@ def prepare_share():
         "allow_channel_chats": False,
     }
     try:
-        resp = requests.post(f"{TELEGRAM_API_URL}/savePreparedInlineMessage", json=payload, timeout=10)
+        resp = requests.post(f"{SHARE_CARD_API_URL}/savePreparedInlineMessage", json=payload, timeout=10)
         body = resp.json() if resp.content else {}
         if not resp.ok or not body.get('ok'):
             logger.error(f"savePreparedInlineMessage failed: {resp.status_code} {resp.text[:300]}")
@@ -460,7 +465,7 @@ def refresh_share():
         "reply_markup": _share_markup((data.get('buttonText') or 'Присоединиться')[:64], button_url),
     }
     try:
-        resp = requests.post(f"{TELEGRAM_API_URL}/editMessageText", json=payload, timeout=10)
+        resp = requests.post(f"{SHARE_CARD_API_URL}/editMessageText", json=payload, timeout=10)
         body = resp.json() if resp.content else {}
         if resp.ok and body.get('ok'):
             return jsonify({'success': True})
