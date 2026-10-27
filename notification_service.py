@@ -453,7 +453,13 @@ def prepare_share():
 import re as _re
 
 TELEGRAM_WEBHOOK_SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
-_INLINE_QUERY_RE = _re.compile(r'^\s*ev(\d+)(?:_(\d+))?\s*$')
+# ev<id>[d<yyyymmdd>][_<inviterUserId>]
+_INLINE_QUERY_RE = _re.compile(r'^\s*ev(\d+)(?:d(\d{8}))?(?:_(\d+))?\s*$')
+_RESULT_ID_RE = _re.compile(r'^ev(\d+)(?:d(\d{8}))?$')
+
+
+def _iso_from_compact(d):
+    return f"{d[:4]}-{d[4:6]}-{d[6:]}" if d else None
 
 
 def _events_post(path: str, payload: Dict, timeout: int = 8):
@@ -470,14 +476,15 @@ def _handle_inline_query(iq: Dict):
     results = []
     if m:
         event_id = int(m.group(1))
-        inviter = int(m.group(2)) if m.group(2) else None
+        compact_date = m.group(2)
+        inviter = int(m.group(3)) if m.group(3) else None
         try:
-            resp = _events_post('/bot/event-cards/render', {"eventId": event_id, "inviterUserId": inviter})
+            resp = _events_post('/bot/event-cards/render', {"eventId": event_id, "inviterUserId": inviter, "occurrenceDate": _iso_from_compact(compact_date)})
             if resp is not None and resp.ok:
                 card = resp.json()
                 results.append({
                     "type": "article",
-                    "id": f"ev{event_id}",
+                    "id": f"ev{event_id}" + (f"d{compact_date}" if compact_date else ""),
                     "title": (card.get('title') or 'Place&Play')[:100],
                     "description": "Отправить карточку с кнопкой «Присоединиться»",
                     "input_message_content": {
@@ -506,15 +513,14 @@ def _handle_chosen_inline_result(chosen: Dict):
     result_id = chosen.get('result_id') or ''
     inline_message_id = chosen.get('inline_message_id')
     logger.info(f"CHOSEN_INLINE_RESULT result_id={result_id} inline_message_id={inline_message_id}")
-    if not result_id.startswith('ev') or not inline_message_id:
+    rm = _RESULT_ID_RE.match(result_id)
+    if not rm or not inline_message_id:
         return
-    try:
-        event_id = int(result_id[2:])
-    except ValueError:
-        return
+    event_id = int(rm.group(1))
     try:
         resp = _events_post('/bot/event-cards', {
             "eventId": event_id,
+            "occurrenceDate": _iso_from_compact(rm.group(2)),
             "inlineMessageId": inline_message_id,
             "telegramUserId": (chosen.get('from') or {}).get('id'),
         })
