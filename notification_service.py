@@ -444,6 +444,101 @@ def prepare_share():
         return jsonify({'success': False, 'error': 'telegram unreachable'}), 502
 
 
+# ---------------------------------------------------------------------------
+# Webhook Telegram: inline-режим для карточек «Присоединиться».
+# Mini App вызывает switchInlineQuery("ev830"), Telegram присылает inline_query сюда,
+# мы отвечаем карточкой события; после выбора приходит chosen_inline_result с
+# inline_message_id — регистрируем его в Events, чтобы потом обновлять карточку в чате.
+# ---------------------------------------------------------------------------
+import re as _re
+
+TELEGRAM_WEBHOOK_SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
+_INLINE_QUERY_RE = _re.compile(r'^\s*ev(\d+)(?:_(\d+))?\s*$')
+
+
+def _events_post(path: str, payload: Dict, timeout: int = 8):
+    base = (os.getenv('EVENTS_INTERNAL_BASE_URL') or '').rstrip('/')
+    key = os.getenv('EVENTS_CARD_REGISTER_KEY') or ''
+    if not base or not key:
+        logger.warning('EVENTS_INTERNAL_BASE_URL/EVENTS_CARD_REGISTER_KEY не заданы')
+        return None
+    return requests.post(f"{base}{path}", json=payload, headers={"X-Internal-Key": key}, timeout=timeout)
+
+
+def _handle_inline_query(iq: Dict):
+    m = _INLINE_QUERY_RE.match(iq.get('query') or '')
+    results = []
+    if m:
+        event_id = int(m.group(1))
+        inviter = int(m.group(2)) if m.group(2) else None
+        try:
+            resp = _events_post('/bot/event-cards/render', {"eventId": event_id, "inviterUserId": inviter})
+            if resp is not None and resp.ok:
+                card = resp.json()
+                results.append({
+                    "type": "article",
+                    "id": f"ev{event_id}",
+                    "title": (card.get('title') or 'Place&Play')[:100],
+                    "description": "Отправить карточку с кнопкой «Присоединиться»",
+                    "input_message_content": {
+                        "message_text": card.get('text') or '',
+                        "parse_mode": "HTML",
+                        "link_preview_options": {"is_disabled": True},
+                    },
+                    "reply_markup": _share_markup((card.get('buttonText') or 'Присоединиться')[:64], card.get('buttonUrl') or ''),
+                })
+            else:
+                logger.warning(f"inline_query: render event={event_id} -> {resp.status_code if resp is not None else 'no response'}")
+        except Exception as e:
+            logger.error(f"inline_query: render failed: {e}")
+    try:
+        requests.post(f"{SHARE_CARD_API_URL}/answerInlineQuery", json={
+            "inline_query_id": iq.get('id'),
+            "results": results,
+            "cache_time": 0,
+            "is_personal": True,
+        }, timeout=8)
+    except Exception as e:
+        logger.error(f"answerInlineQuery failed: {e}")
+
+
+def _handle_chosen_inline_result(chosen: Dict):
+    result_id = chosen.get('result_id') or ''
+    inline_message_id = chosen.get('inline_message_id')
+    logger.info(f"CHOSEN_INLINE_RESULT result_id={result_id} inline_message_id={inline_message_id}")
+    if not result_id.startswith('ev') or not inline_message_id:
+        return
+    try:
+        event_id = int(result_id[2:])
+    except ValueError:
+        return
+    try:
+        resp = _events_post('/bot/event-cards', {
+            "eventId": event_id,
+            "inlineMessageId": inline_message_id,
+            "telegramUserId": (chosen.get('from') or {}).get('id'),
+        })
+        logger.info(f"Регистрация карточки события {event_id}: HTTP {resp.status_code if resp is not None else 'no response'}")
+    except Exception as e:
+        logger.error(f"Не удалось зарегистрировать карточку события {event_id}: {e}")
+
+
+@app.route('/telegram/webhook', methods=['POST'])
+def telegram_webhook():
+    """Приёмник обновлений бота (inline_query, chosen_inline_result). Защищён secret_token."""
+    if not TELEGRAM_WEBHOOK_SECRET or request.headers.get('X-Telegram-Bot-Api-Secret-Token') != TELEGRAM_WEBHOOK_SECRET:
+        return jsonify({'ok': False}), 403
+    update = request.get_json(silent=True) or {}
+    try:
+        if update.get('inline_query'):
+            _handle_inline_query(update['inline_query'])
+        elif update.get('chosen_inline_result'):
+            _handle_chosen_inline_result(update['chosen_inline_result'])
+    except Exception as e:
+        logger.error(f"telegram_webhook error: {e}")
+    return jsonify({'ok': True})
+
+
 @app.route('/refresh-share', methods=['POST'])
 @check_api_key
 def refresh_share():
